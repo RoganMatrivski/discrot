@@ -5,7 +5,69 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use time::UtcDateTime;
 
-use eyre::{Result, eyre};
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("limit must be non-zero")]
+    InvalidLimit,
+
+    #[error("invalid snowflake '{0}': {1}")]
+    InvalidSnowflake(String, #[source] std::num::ParseIntError),
+
+    #[error("invalid timestamp: {0}")]
+    InvalidTimestamp(String),
+
+    #[error("timestamp predates the Discord epoch")]
+    TimestampTooEarly,
+
+    #[error("worker_id must be ≤ 1023")]
+    InvalidWorkerId,
+
+    #[error("sequence must be ≤ 4095")]
+    InvalidSequence,
+
+    #[error("timestamp too large for a Discord snowflake")]
+    TimestampTooLarge,
+
+    #[error("expected yyyyMM, got {0}")]
+    InvalidMonthFormat(String),
+
+    #[error("month {0} is out of range 1–12")]
+    MonthOutOfRange(u8),
+
+    #[error("DISCORD_TOKEN not set")]
+    MissingToken,
+
+    #[error("DISCORD_CHANNEL_IDS not set")]
+    MissingChannels,
+
+    #[error("LOOKBACK_MINUTES must be an integer: {0}")]
+    InvalidLookback(#[source] std::num::ParseIntError),
+
+    #[error("channel {0} has no guild_id")]
+    MissingGuildId(String),
+
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    ParseInt(#[from] std::num::ParseIntError),
+
+    #[error(transparent)]
+    TimeComponentRange(#[from] time::error::ComponentRange),
+
+    #[error(transparent)]
+    TimeFormat(#[from] time::error::Format),
+
+    #[error("URL exclusion filter error: {0}")]
+    AhoCorasick(#[from] aho_corasick::BuildError),
+
+    #[error("other error: {0}")]
+    Other(String),
+}
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
 
@@ -69,7 +131,7 @@ impl<H: HttpClient> DiscordClient<H> {
 
     pub async fn get_messages(&self, channel_id: &str, limit: u8) -> Result<Vec<Message>> {
         if limit == 0 {
-            return Err(eyre!("limit must be non-zero"));
+            return Err(Error::InvalidLimit);
         }
         self.get_json(&format!("/channels/{channel_id}/messages?limit={limit}"))
             .await
@@ -82,7 +144,7 @@ impl<H: HttpClient> DiscordClient<H> {
         limit: u8,
     ) -> Result<Vec<Message>> {
         if limit == 0 {
-            return Err(eyre!("limit must be non-zero"));
+            return Err(Error::InvalidLimit);
         }
         self.get_json(&format!(
             "/channels/{channel_id}/messages?before={before_id}&limit={limit}"
@@ -206,7 +268,7 @@ impl Message {
 // ---------------------------------------------------------------------------
 
 pub mod utils {
-    use eyre::{Result, eyre};
+    use crate::{Error, Result};
     use time::{Date, Month, UtcDateTime};
 
     const DISCORD_EPOCH: i64 = 1_420_070_400_000;
@@ -214,13 +276,14 @@ pub mod utils {
     pub fn snowflake_to_unix_ms(s: &str) -> Result<i64> {
         let snowflake: u64 = s
             .parse()
-            .map_err(|e| eyre!("invalid snowflake '{s}': {e}"))?;
+            .map_err(|e| Error::InvalidSnowflake(s.to_string(), e))?;
         Ok((snowflake >> 22) as i64 + DISCORD_EPOCH)
     }
 
     pub fn snowflake_to_utc_datetime(s: &str) -> Result<UtcDateTime> {
         let ms = snowflake_to_unix_ms(s)?;
-        UtcDateTime::from_unix_timestamp(ms / 1000).map_err(|e| eyre!("invalid timestamp: {e}"))
+        UtcDateTime::from_unix_timestamp(ms / 1000)
+            .map_err(|e| Error::InvalidTimestamp(e.to_string()))
     }
 
     pub fn unix_ms_to_snowflake(
@@ -229,17 +292,17 @@ pub mod utils {
         sequence: u16,
     ) -> Result<String> {
         if timestamp_ms < DISCORD_EPOCH {
-            return Err(eyre!("timestamp predates the Discord epoch"));
+            return Err(Error::TimestampTooEarly);
         }
         if worker_id > 0x3FF {
-            return Err(eyre!("worker_id must be ≤ 1023"));
+            return Err(Error::InvalidWorkerId);
         }
         if sequence > 0xFFF {
-            return Err(eyre!("sequence must be ≤ 4095"));
+            return Err(Error::InvalidSequence);
         }
         let offset = (timestamp_ms - DISCORD_EPOCH) as u64;
         if offset >> 42 != 0 {
-            return Err(eyre!("timestamp too large for a Discord snowflake"));
+            return Err(Error::TimestampTooLarge);
         }
         let snowflake = (offset << 22) | ((worker_id as u64) << 12) | (sequence as u64);
         Ok(snowflake.to_string())
@@ -248,12 +311,12 @@ pub mod utils {
     pub fn parse_month(s: &str) -> Result<Date> {
         let s = s.replace('-', "");
         if s.len() != 6 {
-            return Err(eyre!("expected yyyyMM, got {s:?}"));
+            return Err(Error::InvalidMonthFormat(s));
         }
         let year: i32 = s[0..4].parse()?;
         let month: u8 = s[4..6].parse()?;
         if !(1..=12).contains(&month) {
-            return Err(eyre!("month {month} is out of range 1–12"));
+            return Err(Error::MonthOutOfRange(month));
         }
         Ok(Date::from_calendar_date(year, Month::try_from(month)?, 1)?)
     }
@@ -273,14 +336,13 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
-            discord_token: std::env::var("DISCORD_TOKEN")
-                .map_err(|_| eyre!("DISCORD_TOKEN not set"))?,
+            discord_token: std::env::var("DISCORD_TOKEN").map_err(|_| Error::MissingToken)?,
             channel_ids: std::env::var("DISCORD_CHANNEL_IDS")
-                .map_err(|_| eyre!("DISCORD_CHANNEL_IDS not set"))?,
+                .map_err(|_| Error::MissingChannels)?,
             lookback_minutes: std::env::var("LOOKBACK_MINUTES")
                 .unwrap_or_else(|_| "60".into())
                 .parse()
-                .map_err(|_| eyre!("LOOKBACK_MINUTES must be an integer"))?,
+                .map_err(|e| Error::InvalidLookback(e))?,
             output_path: std::env::var("OUTPUT_PATH").ok().map(Into::into),
         })
     }
@@ -300,11 +362,11 @@ const EXCLUDED_PATTERNS: &[&str] = &[
     "media.tumblr.",
 ];
 
-fn build_excluder() -> aho_corasick::AhoCorasick {
+fn build_excluder() -> Result<aho_corasick::AhoCorasick> {
     aho_corasick::AhoCorasick::builder()
         .ascii_case_insensitive(true)
         .build(EXCLUDED_PATTERNS)
-        .expect("failed to build URL exclusion filter")
+        .map_err(Error::from)
 }
 
 use futures::{StreamExt, stream};
@@ -317,7 +379,7 @@ pub async fn run_with_client<H: HttpClient>(cfg: &Config, client: DiscordClient<
 
     tracing::debug!("Scanning range {range:?}");
 
-    let excluder = std::sync::Arc::new(build_excluder());
+    let excluder = std::sync::Arc::new(build_excluder()?);
     let finder = std::sync::Arc::new(linkify::LinkFinder::new());
 
     let channel_results = stream::iter(cfg.channel_ids.split(',').map(|ch_id| {
@@ -375,7 +437,7 @@ async fn fetch_channel_links<H: HttpClient>(
     let ch = client.get_channel(ch_id).await?;
     let guild_id = ch
         .guild_id
-        .ok_or_else(|| eyre!("channel {ch_id} has no guild_id"))?;
+        .ok_or_else(|| Error::MissingGuildId(ch_id.to_string()))?;
     let server_name = client.get_guild(&guild_id).await?.name;
 
     let messages = client.get_messages_range(ch_id, range, None).await?;
@@ -415,4 +477,29 @@ async fn fetch_channel_links<H: HttpClient>(
     );
 
     Ok(kept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_invalid_limit() {
+        // We need a dummy client to test this, but we can also test utils directly
+        let res = utils::parse_month("2023-13");
+        assert!(matches!(res, Err(Error::MonthOutOfRange(13))));
+    }
+
+    #[test]
+    fn test_invalid_snowflake() {
+        let res = utils::snowflake_to_unix_ms("not-a-snowflake");
+        assert!(matches!(res, Err(Error::InvalidSnowflake(_, _))));
+    }
+
+    #[test]
+    fn test_config_missing_token() {
+        unsafe { std::env::remove_var("DISCORD_TOKEN") };
+        let res = Config::from_env();
+        assert!(matches!(res, Err(Error::MissingToken)));
+    }
 }
