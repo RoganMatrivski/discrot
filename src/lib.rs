@@ -67,6 +67,18 @@ pub enum Error {
 
     #[error("other error: {0}")]
     Other(String),
+
+    #[error("rate limited, retry after {retry_after:?}")]
+    RateLimited { retry_after: Duration },
+
+    #[error("HTTP status {0}")]
+    HttpStatus(u16),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Reqwest error: {0}")]
+    Reqwest(String),
 }
 
 const DISCORD_API: &str = "https://discord.com/api/v10";
@@ -501,5 +513,16 @@ mod tests {
         unsafe { std::env::remove_var("DISCORD_TOKEN") };
         let res = Config::from_env();
         assert!(matches!(res, Err(Error::MissingToken)));
+    }
+
+    #[test]
+    fn test_error_variants() {
+        let err = Error::HttpStatus(404);
+        assert_eq!(err.to_string(), "HTTP status 404");
+
+        let err = Error::RateLimited {
+            retry_after: Duration::from_secs(5),
+        };
+        assert_eq!(err.to_string(), "rate limited, retry after 5s");
     }
 }
