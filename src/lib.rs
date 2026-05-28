@@ -3,11 +3,49 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use time::UtcDateTime;
+use time::OffsetDateTime as UtcDateTime;
 
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A Discord Snowflake (ID). Transmitted as a string in JSON, but 64-bit internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Snowflake(pub u64);
+
+impl serde::Serialize for Snowflake {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Snowflake {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<u64>()
+            .map(Snowflake)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::str::FromStr for Snowflake {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
+}
+
+impl std::fmt::Display for Snowflake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -133,15 +171,15 @@ impl<H: HttpClient> DiscordClient<H> {
             .await
     }
 
-    pub async fn get_channel(&self, channel_id: &str) -> Result<Channel> {
+    pub async fn get_channel(&self, channel_id: Snowflake) -> Result<Channel> {
         self.get_json(&format!("/channels/{channel_id}")).await
     }
 
-    pub async fn get_guild(&self, guild_id: &str) -> Result<Guild> {
+    pub async fn get_guild(&self, guild_id: Snowflake) -> Result<Guild> {
         self.get_json(&format!("/guilds/{guild_id}")).await
     }
 
-    pub async fn get_messages(&self, channel_id: &str, limit: u8) -> Result<Vec<Message>> {
+    pub async fn get_messages(&self, channel_id: Snowflake, limit: u8) -> Result<Vec<Message>> {
         if limit == 0 {
             return Err(Error::InvalidLimit);
         }
@@ -151,8 +189,8 @@ impl<H: HttpClient> DiscordClient<H> {
 
     pub async fn get_messages_before(
         &self,
-        channel_id: &str,
-        before_id: &str,
+        channel_id: Snowflake,
+        before_id: Snowflake,
         limit: u8,
     ) -> Result<Vec<Message>> {
         if limit == 0 {
@@ -171,7 +209,7 @@ impl<H: HttpClient> DiscordClient<H> {
     /// the window (all subsequent messages are older and also outside it).
     pub async fn get_messages_range(
         &self,
-        channel_id: &str,
+        channel_id: Snowflake,
         date_range: impl std::ops::RangeBounds<UtcDateTime> + Clone,
         limit: Option<usize>,
     ) -> Result<Vec<Message>> {
@@ -195,7 +233,7 @@ impl<H: HttpClient> DiscordClient<H> {
         let mut messages = filter_messages(match date_range.end_bound() {
             std::ops::Bound::Included(&d) | std::ops::Bound::Excluded(&d) => {
                 let before_id = utils::unix_ms_to_snowflake(d.unix_timestamp() * 1000, 0, 0)?;
-                self.get_messages_before(channel_id, &before_id, batch_size(0))
+                self.get_messages_before(channel_id, before_id, batch_size(0))
                     .await?
             }
             std::ops::Bound::Unbounded => self.get_messages(channel_id, batch_size(0)).await?,
@@ -223,10 +261,10 @@ impl<H: HttpClient> DiscordClient<H> {
             if !date_range.contains(&last.timestamp()?) {
                 break;
             }
-            let last_id = last.id.clone();
+            let last_id = last.id;
 
             let batch = filter_messages(
-                self.get_messages_before(channel_id, &last_id, batch_size(messages.len()))
+                self.get_messages_before(channel_id, last_id, batch_size(messages.len()))
                     .await?,
             );
             if batch.is_empty() {
@@ -243,35 +281,71 @@ impl<H: HttpClient> DiscordClient<H> {
 // Domain types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Channel {
-    pub id: String,
-    pub name: String,
-    pub guild_id: Option<String>,
+    pub id: Snowflake,
+    #[serde(rename = "type")]
+    pub channel_type: u8,
+    pub name: Option<String>,
+    pub guild_id: Option<Snowflake>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Guild {
-    pub id: String,
+    pub id: Snowflake,
     pub name: String,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct User {
-    pub id: String,
+    pub id: Snowflake,
     pub username: String,
+    pub global_name: Option<String>,
+    #[serde(default)]
+    pub bot: bool,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Message {
-    pub id: String,
-    pub content: String,
+    pub id: Snowflake,
+    pub channel_id: Snowflake,
+    pub guild_id: Option<Snowflake>,
     pub author: User,
+    pub content: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: UtcDateTime,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+    #[serde(default)]
+    pub embeds: Vec<Embed>,
+    pub message_reference: Option<MessageReference>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Attachment {
+    pub id: Snowflake,
+    pub filename: String,
+    pub url: String,
+    pub content_type: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Embed {
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MessageReference {
+    pub message_id: Option<Snowflake>,
+    pub channel_id: Option<Snowflake>,
+    pub guild_id: Option<Snowflake>,
 }
 
 impl Message {
     pub fn timestamp(&self) -> Result<UtcDateTime> {
-        utils::snowflake_to_utc_datetime(&self.id)
+        utils::snowflake_to_utc_datetime(self.id)
     }
 }
 
@@ -280,20 +354,17 @@ impl Message {
 // ---------------------------------------------------------------------------
 
 pub mod utils {
-    use crate::{Error, Result};
-    use time::{Date, Month, UtcDateTime};
+    use crate::{Error, Result, Snowflake, UtcDateTime};
+    use time::{Date, Month};
 
     const DISCORD_EPOCH: i64 = 1_420_070_400_000;
 
-    pub fn snowflake_to_unix_ms(s: &str) -> Result<i64> {
-        let snowflake: u64 = s
-            .parse()
-            .map_err(|e| Error::InvalidSnowflake(s.to_string(), e))?;
-        Ok((snowflake >> 22) as i64 + DISCORD_EPOCH)
+    pub fn snowflake_to_unix_ms(snowflake: Snowflake) -> Result<i64> {
+        Ok((snowflake.0 >> 22) as i64 + DISCORD_EPOCH)
     }
 
-    pub fn snowflake_to_utc_datetime(s: &str) -> Result<UtcDateTime> {
-        let ms = snowflake_to_unix_ms(s)?;
+    pub fn snowflake_to_utc_datetime(snowflake: Snowflake) -> Result<UtcDateTime> {
+        let ms = snowflake_to_unix_ms(snowflake)?;
         UtcDateTime::from_unix_timestamp(ms / 1000)
             .map_err(|e| Error::InvalidTimestamp(e.to_string()))
     }
@@ -302,7 +373,7 @@ pub mod utils {
         timestamp_ms: i64,
         worker_id: u16,
         sequence: u16,
-    ) -> Result<String> {
+    ) -> Result<Snowflake> {
         if timestamp_ms < DISCORD_EPOCH {
             return Err(Error::TimestampTooEarly);
         }
@@ -317,7 +388,7 @@ pub mod utils {
             return Err(Error::TimestampTooLarge);
         }
         let snowflake = (offset << 22) | ((worker_id as u64) << 12) | (sequence as u64);
-        Ok(snowflake.to_string())
+        Ok(Snowflake(snowflake))
     }
 
     pub fn parse_month(s: &str) -> Result<Date> {
@@ -385,7 +456,7 @@ use futures::{StreamExt, stream};
 
 /// Separate so tests can inject a mock `HttpClient`.
 pub async fn run_with_client<H: HttpClient>(cfg: &Config, client: DiscordClient<H>) -> Result<()> {
-    let now = UtcDateTime::now();
+    let now = UtcDateTime::now_utc();
     let since = now.saturating_sub(time::Duration::minutes(cfg.lookback_minutes));
     let range = since..now;
 
@@ -399,9 +470,12 @@ pub async fn run_with_client<H: HttpClient>(cfg: &Config, client: DiscordClient<
         let range = range.clone();
         let excluder = excluder.clone();
         let finder = finder.clone();
-        let ch_id = ch_id.to_string();
+        let ch_id = ch_id.parse::<Snowflake>();
 
-        async move { fetch_channel_links(&client, &ch_id, range, &finder, &excluder).await }
+        async move {
+            let ch_id = ch_id.map_err(|e| Error::InvalidSnowflake("".to_string(), e))?;
+            fetch_channel_links(&client, ch_id, range, &finder, &excluder).await
+        }
     }))
     .buffer_unordered(8)
     .collect::<Vec<_>>()
@@ -441,7 +515,7 @@ pub async fn run_with_client<H: HttpClient>(cfg: &Config, client: DiscordClient<
 #[tracing::instrument(skip(client, range, finder, excluder))]
 async fn fetch_channel_links<H: HttpClient>(
     client: &DiscordClient<H>,
-    ch_id: &str,
+    ch_id: Snowflake,
     range: impl std::ops::RangeBounds<UtcDateTime> + Clone,
     finder: &linkify::LinkFinder,
     excluder: &aho_corasick::AhoCorasick,
@@ -450,9 +524,12 @@ async fn fetch_channel_links<H: HttpClient>(
     let guild_id = ch
         .guild_id
         .ok_or_else(|| Error::MissingGuildId(ch_id.to_string()))?;
-    let server_name = client.get_guild(&guild_id).await?.name;
+    let server_name = client.get_guild(guild_id).await?.name;
 
-    let messages = client.get_messages_range(ch_id, range, None).await?;
+    let mut messages = client.get_messages_range(ch_id, range, None).await?;
+    for m in &mut messages {
+        m.guild_id = Some(guild_id);
+    }
 
     if let Some(m) = messages.first() {
         tracing::debug!(
@@ -467,10 +544,22 @@ async fn fetch_channel_links<H: HttpClient>(
     let all_links: Vec<String> = messages
         .into_iter()
         .flat_map(|m| {
-            finder
+            let mut links = finder
                 .links(&m.content)
                 .map(|l| l.as_str().to_string())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+
+            for attachment in m.attachments {
+                links.push(attachment.url);
+            }
+
+            for embed in m.embeds {
+                if let Some(url) = embed.url {
+                    links.push(url);
+                }
+            }
+
+            links
         })
         .collect();
 
@@ -503,9 +592,53 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_snowflake() {
-        let res = utils::snowflake_to_unix_ms("not-a-snowflake");
-        assert!(matches!(res, Err(Error::InvalidSnowflake(_, _))));
+    fn test_invalid_snowflake_parse() {
+        let res = "not-a-snowflake".parse::<Snowflake>();
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_message_deserialization() {
+        let json = r#"{
+            "id": "1197179023961378856",
+            "channel_id": "832407655440056381",
+            "content": "Check this out!",
+            "timestamp": "2024-01-17T14:30:00Z",
+            "author": {
+                "id": "123456789",
+                "username": "testuser",
+                "global_name": "Test User",
+                "bot": false
+            },
+            "attachments": [
+                {
+                    "id": "987654321",
+                    "filename": "image.png",
+                    "url": "https://example.com/image.png",
+                    "content_type": "image/png"
+                }
+            ],
+            "embeds": [
+                {
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "description": "An example embed"
+                }
+            ]
+        }"#;
+
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.id.0, 1197179023961378856);
+        assert_eq!(msg.author.username, "testuser");
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.embeds.len(), 1);
+        assert_eq!(msg.attachments[0].filename, "image.png");
+    }
+    #[test]
+    fn test_snowflake_roundtrip() {
+        let s = "1197179023961378856";
+        let sn: Snowflake = s.parse().unwrap();
+        assert_eq!(sn.to_string(), s);
     }
 
     #[test]
