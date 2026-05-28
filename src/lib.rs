@@ -47,6 +47,26 @@ impl std::fmt::Display for Snowflake {
     }
 }
 
+impl From<u64> for Snowflake {
+    fn from(val: u64) -> Self {
+        Self(val)
+    }
+}
+
+impl TryFrom<&str> for Snowflake {
+    type Error = std::num::ParseIntError;
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl TryFrom<String> for Snowflake {
+    type Error = std::num::ParseIntError;
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("limit must be non-zero")]
@@ -171,15 +191,22 @@ impl<H: HttpClient> DiscordClient<H> {
             .await
     }
 
-    pub async fn get_channel(&self, channel_id: Snowflake) -> Result<Channel> {
+    pub async fn get_channel(&self, channel_id: impl Into<Snowflake>) -> Result<Channel> {
+        let channel_id = channel_id.into();
         self.get_json(&format!("/channels/{channel_id}")).await
     }
 
-    pub async fn get_guild(&self, guild_id: Snowflake) -> Result<Guild> {
+    pub async fn get_guild(&self, guild_id: impl Into<Snowflake>) -> Result<Guild> {
+        let guild_id = guild_id.into();
         self.get_json(&format!("/guilds/{guild_id}")).await
     }
 
-    pub async fn get_messages(&self, channel_id: Snowflake, limit: u8) -> Result<Vec<Message>> {
+    pub async fn get_messages(
+        &self,
+        channel_id: impl Into<Snowflake>,
+        limit: u8,
+    ) -> Result<Vec<Message>> {
+        let channel_id = channel_id.into();
         if limit == 0 {
             return Err(Error::InvalidLimit);
         }
@@ -189,10 +216,12 @@ impl<H: HttpClient> DiscordClient<H> {
 
     pub async fn get_messages_before(
         &self,
-        channel_id: Snowflake,
-        before_id: Snowflake,
+        channel_id: impl Into<Snowflake>,
+        before_id: impl Into<Snowflake>,
         limit: u8,
     ) -> Result<Vec<Message>> {
+        let channel_id = channel_id.into();
+        let before_id = before_id.into();
         if limit == 0 {
             return Err(Error::InvalidLimit);
         }
@@ -346,6 +375,53 @@ pub struct MessageReference {
 impl Message {
     pub fn timestamp(&self) -> Result<UtcDateTime> {
         utils::snowflake_to_utc_datetime(self.id)
+    }
+
+    /// Format this single message for embedding/display
+    pub fn to_context_string(&self) -> String {
+        let author = self
+            .author
+            .global_name
+            .as_deref()
+            .unwrap_or(&self.author.username);
+
+        let mut parts = vec![];
+
+        if !self.content.is_empty() {
+            parts.push(self.content.clone());
+        }
+
+        // include attachment filenames as context
+        if !self.attachments.is_empty() {
+            let files = self
+                .attachments
+                .iter()
+                .map(|a| a.filename.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("[files: {}]", files));
+        }
+
+        // include embed titles/descriptions
+        for embed in &self.embeds {
+            match (&embed.title, &embed.description) {
+                (Some(t), Some(d)) => parts.push(format!("[embed: {} — {}]", t, d)),
+                (Some(t), None) => parts.push(format!("[embed: {}]", t)),
+                (None, Some(d)) => parts.push(format!("[embed: {}]", d)),
+                _ => {}
+            }
+        }
+
+        format!("{}: {}", author, parts.join(" "))
+    }
+
+    /// Format a chain of messages (oldest → newest) into one context string
+    pub fn context_from_chain(chain: &[Message]) -> String {
+        chain
+            .iter()
+            .map(|m| m.to_context_string())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
